@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -106,43 +106,20 @@ func healthHandler(config *Config) http.HandlerFunc {
 	}
 }
 
-// routeForServer returns the HTTP path a named server's route is (or will
-// be) mounted at under baseURL, always with a trailing slash so it matches
-// as a subtree.
-func routeForServer(baseURL *url.URL, name string) string {
-	mcpRoute := path.Join(baseURL.Path, name)
-	if !strings.HasPrefix(mcpRoute, "/") {
-		mcpRoute = "/" + mcpRoute
-	}
-	if !strings.HasSuffix(mcpRoute, "/") {
-		mcpRoute += "/"
-	}
-	return mcpRoute
-}
-
-// notReadyHandler responds to every request with a clear, immediate error
-// instead of a bare 404, for a server whose most recent connect attempt
-// failed (most commonly: no valid OAuth token yet - see err, which for that
-// case already carries the exact `-authorize` command to run, courtesy of
-// oauthAwareError). It never touches the network: the failure reason was
-// captured once, at connect time, not looked up per request.
-func notReadyHandler(name string, err error) http.Handler {
-	message := fmt.Sprintf("mcp-proxy: server %q is not available: %v\n", name, err)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, message, http.StatusServiceUnavailable)
-	})
-}
-
 // connectAndMount runs a single server's connect/initialize sequence
 // against an already-built client and server pair and mounts its HTTP
 // route on httpMux either way: on success, the real proxying handler; on
-// failure, notReadyHandler, so the route always exists and a request
-// against it always gets a clear answer instead of a bare 404. It's the
-// per-server body of the startup connect loop, factored out so the same
-// sequence can be re-run later for a single server (e.g. after
-// `-authorize` provides a credential that wasn't there at startup) without
-// repeating the whole loop or requiring a restart.
-func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientConfigV2, info mcp.Implementation, mcpClient *Client, srv *Server, baseURL *url.URL, httpMux *http.ServeMux) error {
+// failure, a serverRoute that retries lazily on each subsequent request
+// (see docs/OAUTH_LIFECYCLE.md and route.go) instead of requiring a
+// restart. The route always exists either way, so a request against it
+// always gets a clear answer instead of a bare 404. It's the per-server
+// body of the startup connect loop, factored out so the same sequence can
+// be re-run later for a single server without repeating the whole loop.
+//
+// Returns the serverRoute mounted on failure (nil on success) so the
+// caller can track it and, at shutdown, close its client if it ever
+// connects.
+func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientConfigV2, proxyConfig *MCPProxyConfigV2, info mcp.Implementation, mcpClient *Client, srv *Server, baseURL *url.URL, httpMux *http.ServeMux) (*serverRoute, error) {
 	mcpRoute := routeForServer(baseURL, name)
 
 	slog.Info("Connecting", "client", name)
@@ -150,22 +127,14 @@ func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientCo
 	if addErr != nil {
 		slog.Error("Failed to add client to server", "client", name, "err", addErr)
 		slog.Info("Mounting not-ready route", "client", name, "route", mcpRoute)
-		httpMux.Handle(mcpRoute, notReadyHandler(name, addErr))
-		return addErr
+		route := newServerRoute(ctx, name, clientConfig, proxyConfig, info)
+		httpMux.Handle(mcpRoute, route)
+		return route, addErr
 	}
 	slog.Info("Connected", "client", name)
-
-	middlewares := make([]MiddlewareFunc, 0)
-	middlewares = append(middlewares, recoverMiddleware(name))
-	if clientConfig.Options.LogEnabled.OrElse(false) {
-		middlewares = append(middlewares, loggerMiddleware(name))
-	}
-	if len(clientConfig.Options.AuthTokens) > 0 {
-		middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-	}
 	slog.Info("Handling requests", "client", name, "route", mcpRoute)
-	httpMux.Handle(mcpRoute, chainMiddleware(srv.handler, middlewares...))
-	return nil
+	httpMux.Handle(mcpRoute, wrapHandler(name, clientConfig, srv))
+	return nil, nil
 }
 
 func startHTTPServer(config *Config) error {
@@ -187,6 +156,8 @@ func startHTTPServer(config *Config) error {
 		Name: config.McpProxy.Name,
 	}
 	clients := make(map[string]*Client, len(config.McpServers))
+	var routesMu sync.Mutex
+	var routes []*serverRoute
 
 	// Unauthenticated health endpoints for liveness/readiness probes.
 	health := healthHandler(config)
@@ -208,7 +179,12 @@ func startHTTPServer(config *Config) error {
 		}
 		clients[name] = mcpClient
 		errorGroup.Go(func() error {
-			connErr := connectAndMount(ctx, name, clientConfig, info, mcpClient, server, baseURL, httpMux)
+			route, connErr := connectAndMount(ctx, name, clientConfig, config.McpProxy, info, mcpClient, server, baseURL, httpMux)
+			if route != nil {
+				routesMu.Lock()
+				routes = append(routes, route)
+				routesMu.Unlock()
+			}
 			if connErr != nil && clientConfig.Options.PanicIfInvalid.OrElse(false) {
 				return connErr
 			}
@@ -247,6 +223,11 @@ func startHTTPServer(config *Config) error {
 			slog.Info("Shutting down", "client", name)
 			if err := client.Close(); err != nil {
 				shutdownErrors = append(shutdownErrors, fmt.Errorf("close client %q: %w", name, err))
+			}
+		}
+		for _, route := range routes {
+			if err := route.Close(); err != nil {
+				shutdownErrors = append(shutdownErrors, fmt.Errorf("close client %q: %w", route.name, err))
 			}
 		}
 		return errors.Join(shutdownErrors...)
