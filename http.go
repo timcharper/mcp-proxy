@@ -106,6 +106,42 @@ func healthHandler(config *Config) http.HandlerFunc {
 	}
 }
 
+// connectAndMount runs a single server's connect/initialize sequence
+// against an already-built client and server pair and, on success, wires
+// its tools/prompts/resources into srv.mcpServer and mounts its HTTP route
+// on httpMux. It's the per-server body of the startup connect loop, factored
+// out so the same sequence can be re-run later for a single server (e.g.
+// after `-authorize` provides a credential that wasn't there at startup)
+// without repeating the whole loop or requiring a restart.
+func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientConfigV2, info mcp.Implementation, mcpClient *Client, srv *Server, baseURL *url.URL, httpMux *http.ServeMux) error {
+	slog.Info("Connecting", "client", name)
+	addErr := mcpClient.addToMCPServer(ctx, info, srv.mcpServer)
+	if addErr != nil {
+		slog.Error("Failed to add client to server", "client", name, "err", addErr)
+		return addErr
+	}
+	slog.Info("Connected", "client", name)
+
+	middlewares := make([]MiddlewareFunc, 0)
+	middlewares = append(middlewares, recoverMiddleware(name))
+	if clientConfig.Options.LogEnabled.OrElse(false) {
+		middlewares = append(middlewares, loggerMiddleware(name))
+	}
+	if len(clientConfig.Options.AuthTokens) > 0 {
+		middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
+	}
+	mcpRoute := path.Join(baseURL.Path, name)
+	if !strings.HasPrefix(mcpRoute, "/") {
+		mcpRoute = "/" + mcpRoute
+	}
+	if !strings.HasSuffix(mcpRoute, "/") {
+		mcpRoute += "/"
+	}
+	slog.Info("Handling requests", "client", name, "route", mcpRoute)
+	httpMux.Handle(mcpRoute, chainMiddleware(srv.handler, middlewares...))
+	return nil
+}
+
 func startHTTPServer(config *Config) error {
 	baseURL, uErr := url.Parse(config.McpProxy.BaseURL)
 	if uErr != nil {
@@ -146,34 +182,10 @@ func startHTTPServer(config *Config) error {
 		}
 		clients[name] = mcpClient
 		errorGroup.Go(func() error {
-			slog.Info("Connecting", "client", name)
-			addErr := mcpClient.addToMCPServer(ctx, info, server.mcpServer)
-			if addErr != nil {
-				slog.Error("Failed to add client to server", "client", name, "err", addErr)
-				if clientConfig.Options.PanicIfInvalid.OrElse(false) {
-					return addErr
-				}
-				return nil
+			connErr := connectAndMount(ctx, name, clientConfig, info, mcpClient, server, baseURL, httpMux)
+			if connErr != nil && clientConfig.Options.PanicIfInvalid.OrElse(false) {
+				return connErr
 			}
-			slog.Info("Connected", "client", name)
-
-			middlewares := make([]MiddlewareFunc, 0)
-			middlewares = append(middlewares, recoverMiddleware(name))
-			if clientConfig.Options.LogEnabled.OrElse(false) {
-				middlewares = append(middlewares, loggerMiddleware(name))
-			}
-			if len(clientConfig.Options.AuthTokens) > 0 {
-				middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-			}
-			mcpRoute := path.Join(baseURL.Path, name)
-			if !strings.HasPrefix(mcpRoute, "/") {
-				mcpRoute = "/" + mcpRoute
-			}
-			if !strings.HasSuffix(mcpRoute, "/") {
-				mcpRoute += "/"
-			}
-			slog.Info("Handling requests", "client", name, "route", mcpRoute)
-			httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
 			return nil
 		})
 	}
