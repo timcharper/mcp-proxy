@@ -78,9 +78,13 @@ it to disk. Run it interactively, in a session with a real browser -
 never from an unattended service/container, since it requires you to log
 in and approve access.
 
-Once authorized, (re)start the daemon. A server's HTTP route is only
-mounted on a successful connect at startup, so if the daemon was already
-running when you authorized, restart it now - the new token won't be
-picked up otherwise. After that, tokens refresh automatically as they
-expire with no further restarts needed. Re-run `-authorize` only if the
-server reports the token is no longer valid (e.g. access was revoked).
+Once authorized, (re)start the daemon. A server's route is always mounted,
+but if it had no valid credential at startup it responds `503 Service
+Unavailable` (with the exact `-authorize` command to run) instead of
+proxying - so if the daemon was already running when you authorized,
+restart it now for the new token to take effect. Restart-free pickup of a
+freshly-run `-authorize` is planned but not yet implemented; see
+[OAUTH_LIFECYCLE.md](OAUTH_LIFECYCLE.md). After a route is working, tokens
+refresh automatically as they expire with no further restarts needed.
+Re-run `-authorize` only if the server reports the token is no longer
+valid (e.g. access was revoked).

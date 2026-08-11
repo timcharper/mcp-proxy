@@ -106,18 +106,51 @@ func healthHandler(config *Config) http.HandlerFunc {
 	}
 }
 
+// routeForServer returns the HTTP path a named server's route is (or will
+// be) mounted at under baseURL, always with a trailing slash so it matches
+// as a subtree.
+func routeForServer(baseURL *url.URL, name string) string {
+	mcpRoute := path.Join(baseURL.Path, name)
+	if !strings.HasPrefix(mcpRoute, "/") {
+		mcpRoute = "/" + mcpRoute
+	}
+	if !strings.HasSuffix(mcpRoute, "/") {
+		mcpRoute += "/"
+	}
+	return mcpRoute
+}
+
+// notReadyHandler responds to every request with a clear, immediate error
+// instead of a bare 404, for a server whose most recent connect attempt
+// failed (most commonly: no valid OAuth token yet - see err, which for that
+// case already carries the exact `-authorize` command to run, courtesy of
+// oauthAwareError). It never touches the network: the failure reason was
+// captured once, at connect time, not looked up per request.
+func notReadyHandler(name string, err error) http.Handler {
+	message := fmt.Sprintf("mcp-proxy: server %q is not available: %v\n", name, err)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, message, http.StatusServiceUnavailable)
+	})
+}
+
 // connectAndMount runs a single server's connect/initialize sequence
-// against an already-built client and server pair and, on success, wires
-// its tools/prompts/resources into srv.mcpServer and mounts its HTTP route
-// on httpMux. It's the per-server body of the startup connect loop, factored
-// out so the same sequence can be re-run later for a single server (e.g.
-// after `-authorize` provides a credential that wasn't there at startup)
-// without repeating the whole loop or requiring a restart.
+// against an already-built client and server pair and mounts its HTTP
+// route on httpMux either way: on success, the real proxying handler; on
+// failure, notReadyHandler, so the route always exists and a request
+// against it always gets a clear answer instead of a bare 404. It's the
+// per-server body of the startup connect loop, factored out so the same
+// sequence can be re-run later for a single server (e.g. after
+// `-authorize` provides a credential that wasn't there at startup) without
+// repeating the whole loop or requiring a restart.
 func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientConfigV2, info mcp.Implementation, mcpClient *Client, srv *Server, baseURL *url.URL, httpMux *http.ServeMux) error {
+	mcpRoute := routeForServer(baseURL, name)
+
 	slog.Info("Connecting", "client", name)
 	addErr := mcpClient.addToMCPServer(ctx, info, srv.mcpServer)
 	if addErr != nil {
 		slog.Error("Failed to add client to server", "client", name, "err", addErr)
+		slog.Info("Mounting not-ready route", "client", name, "route", mcpRoute)
+		httpMux.Handle(mcpRoute, notReadyHandler(name, addErr))
 		return addErr
 	}
 	slog.Info("Connected", "client", name)
@@ -129,13 +162,6 @@ func connectAndMount(ctx context.Context, name string, clientConfig *MCPClientCo
 	}
 	if len(clientConfig.Options.AuthTokens) > 0 {
 		middlewares = append(middlewares, newAuthMiddleware(clientConfig.Options.AuthTokens))
-	}
-	mcpRoute := path.Join(baseURL.Path, name)
-	if !strings.HasPrefix(mcpRoute, "/") {
-		mcpRoute = "/" + mcpRoute
-	}
-	if !strings.HasSuffix(mcpRoute, "/") {
-		mcpRoute += "/"
 	}
 	slog.Info("Handling requests", "client", name, "route", mcpRoute)
 	httpMux.Handle(mcpRoute, chainMiddleware(srv.handler, middlewares...))
