@@ -62,6 +62,17 @@ lost write race, no leaked connections from repeated retries.
 4. **Disk is the sole source of truth, on every request, always.** No
    in-process cache of secret values at any point in this design.
 
+Point 2's local check gates the credential case, not liveness: a server
+with a present-but-bad credential (revoked token, unreachable upstream)
+still attempts a real connect on every request that reaches it, coalesced
+per-server by a single-flight lock (implemented in `route.go`'s
+`serverRoute`) so concurrent requests share one attempt rather than each
+paying for their own. There's deliberately no backoff on repeated failures
+yet - a persistently broken server gets retried on every request that
+reaches it, not just the first. Acceptable for now on the same reasoning as
+the [known limitation](#known-limitation-concurrent-refresh-token-use)
+below: add one if it turns out to matter in practice, don't pre-build it.
+
 ## Explicitly rejected approaches
 
 Worth recording so these don't get re-proposed and re-litigated later:
